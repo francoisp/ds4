@@ -71673,14 +71673,27 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     weights = ds4_add_sat_u64(weights, e->mtp_model.size);
     if (e->dspark) graph_bytes = ds4_add_sat_u64(graph_bytes,
         ds4_mul_sat_u64(UINT64_C(64) << 20, engine_placement_session_count(e)));
-    const uint64_t fixed = ds4_add_sat_u64(weights,
-        ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
+    const uint64_t base = ds4_add_sat_u64(weights, ds4_add_sat_u64(graph_bytes, 2u * gib));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
+    /* The auto cache plan does not see the context.  When the graph leaves no
+     * room for the full prefill reserve, stage one layer of experts at a time
+     * and leave the rest to the decode cache. */
+    const uint64_t headroom = e->ssd_streaming_prefill_headroom_bytes;
+    const uint64_t layer = ds4_mul_sat_u64(expert, DS4_N_EXPERT);
+    if (fit_cache && expert && headroom > layer &&
+        ds4_add_sat_u64(base, ds4_add_sat_u64(headroom, expert)) > budget) {
+        fprintf(stderr, "ds4: V4.1 SSD prefill reserve reduced from %.2f to %.2f GiB "
+                        "for context/runtime headroom\n",
+                ds4_bytes_to_gib(headroom), ds4_bytes_to_gib(layer));
+        e->ssd_streaming_prefill_headroom_bytes = layer;
+    }
+    const uint64_t fixed = ds4_add_sat_u64(base, e->ssd_streaming_prefill_headroom_bytes);
     if (fixed >= budget || (expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
-                        "Use --ssd-streaming or a smaller context.\n",
-                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
+                        "Use %s.\n",
+                ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget),
+                e->ssd_streaming ? "a smaller --ctx" : "--ssd-streaming or a smaller context");
         return false;
     }
     if (expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {

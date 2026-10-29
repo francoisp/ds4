@@ -1562,6 +1562,10 @@ static bool cuda_splitkv_decode_requested(void) {
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
+    /* SSD streaming means VRAM is short: the optional F16 copies are filled
+     * at startup, before the session buffers and the expert staging slots
+     * that streaming cannot run without. */
+    if (!present && g_ssd_streaming_mode) return 0;
     return present ? limit : UINT64_MAX;
 }
 
@@ -29062,10 +29066,13 @@ static int cuda_stream_selected_cache_begin_load(
                 return 0;
             int integrated = 0;
             uint64_t host_available = 0;
-            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
-                integrated && ds4_linux_nonmovable_memory(&host_available))
+            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) != cudaSuccess)
+                integrated = 0;
+            if (integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            /* Unified memory also backs the OS; discrete VRAM only needs
+             * slack for driver and cuBLAS allocations. */
+            const uint64_t reserve = integrated ? UINT64_C(8) << 30 : UINT64_C(1) << 30;
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
@@ -35179,9 +35186,10 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     /* GLM graph memory guard: on this backend the model weights are
      * distributed across all devices by the multi-tier placement, so the
-     * relevant budget is the aggregate VRAM. */
-    int n = 0;
-    if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return 0;
+     * relevant budget is the aggregate VRAM of the initialized devices.
+     * Visible but unused devices must not inflate a single-GPU budget. */
+    int n = g_n_gpus;
+    if (n <= 0 && (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0)) return 0;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
     return (uint64_t)total_b * (uint64_t)n;
