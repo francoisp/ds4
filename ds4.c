@@ -41596,6 +41596,60 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* V4.1 expert devices. A nonzero tier keeps that layer's routed experts
+ * resident on an extra CUDA device: the router and shared expert stay on the
+ * main device and only the routed rows travel. Sessions run one at a time,
+ * so every graph shares one scratch set per device. */
+typedef struct {
+    ds4_gpu_tensor *x, *selected, *weights, *gate, *up, *mid, *down, *out;
+} ds41_expert_scratch;
+static uint8_t g_ds41_expert_tier[DS4_MAX_LAYER];
+static ds41_expert_scratch g_ds41_expert_scratch[DS4_MAX_GPUS];
+static uint32_t g_ds41_expert_rows;
+
+static bool ds41_expert_moe(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                            ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                            const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                            uint32_t rows) {
+    const int tier = g_ds41_expert_tier[il];
+    const ds41_expert_scratch *r = &g_ds41_expert_scratch[tier];
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    bool ok = true;
+    for (uint32_t off = 0; ok && off < rows; off += g_ds41_expert_rows) {
+        const uint32_t n = rows - off < g_ds41_expert_rows ? rows - off : g_ds41_expert_rows;
+        const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        const uint64_t pair_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, off * row_bytes, n * row_bytes);
+        ds4_gpu_tensor *sv = ds4_gpu_tensor_view(selected, off * pair_bytes, n * pair_bytes);
+        ds4_gpu_tensor *wv = ds4_gpu_tensor_view(weights, off * pair_bytes, n * pair_bytes);
+        ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, off * row_bytes, n * row_bytes);
+        bool mid_f16 = false;
+        ok = xv && sv && wv && ov &&
+            ds4_gpu_tensor_copy_xdev3_default_dst(r->x, xv, n * row_bytes,
+                r->selected, sv, n * pair_bytes, r->weights, wv, n * pair_bytes) &&
+            ds4_gpu_set_current_device(tier) == 0 &&
+            ds4_gpu_routed_moe_batch_tensor(r->out, r->gate, r->up, r->mid, r->down,
+                m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, r->selected, r->weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, r->x,
+                il, n, &mid_f16, true) &&
+            ds4_gpu_tensor_copy_xdev_default(ov, r->out, n * row_bytes);
+        if (ds4_gpu_set_current_device(0) != 0) ok = false;
+        ds4_gpu_tensor_free(xv);
+        ds4_gpu_tensor_free(sv);
+        ds4_gpu_tensor_free(wv);
+        ds4_gpu_tensor_free(ov);
+    }
+    if (!ok) fprintf(stderr, "ds4: V4.1 layer %u routed experts failed on expert device tier %d\n",
+                     il, tier);
+    return ok;
+}
+#endif
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -41655,6 +41709,11 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g_ds41_expert_tier[il]) {
+        routed_ok = ds41_expert_moe(m, l, il, routed, g->norm, g->selected, g->route_weights, 1);
+    } else
+#endif
 #ifndef __APPLE__
     if (g->tp_world == 2) {
         routed_ok = ds4_gpu_routed_moe_batch_owned_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -42122,6 +42181,10 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
 #endif
         (
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        g_ds41_expert_tier[il] ?
+        ds41_expert_moe(m, l, il, b->routed, b->norm, b->selected, b->route_weights, count) :
+#endif
 #ifndef __APPLE__
         g->tp_world == 2 ?
         ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
@@ -42628,7 +42691,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             /* File-ordered selected reads are the default. Whole-layer
              * prefetch trades unused weight reads for overlap; retain it as
              * an explicit option for other storage/workload combinations. */
-            if (ok && total_count >= 2048u &&
+            if (ok && total_count >= 2048u && !g_ds41_expert_tier[il] &&
                 getenv("DS4_CUDA_ENABLE_SSD_PREFETCH") != NULL) {
                 const ds4_gpu_stream_expert_table current = graph_stream_expert_table_make(m,
                     &w->layer[il], il,
@@ -43174,6 +43237,10 @@ typedef enum {
 struct ds4_engine {
     char *model_path;
     uint64_t ds41_session_bytes;
+    /* V4.1 on CUDA: --gpu-devices after the first hold routed experts. */
+    int ds41_main_device;
+    int ds41_expert_devices[DS4_MAX_GPUS];
+    int ds41_expert_device_count;
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -65085,6 +65152,11 @@ static int ds4_engine_collect_sequential_imatrix(
             fprintf(stderr, "ds4: V4.1 imatrix collection requires a single-host session\n");
             return 1;
         }
+        /* Offloaded layers never fill the main device's routed activations. */
+        if (e->ds41_expert_device_count) {
+            fprintf(stderr, "ds4: V4.1 imatrix collection requires a single GPU\n");
+            return 1;
+        }
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
@@ -71720,6 +71792,102 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
     return ds41_memory_admit_for_host(e, graph_bytes, fit_cache,
         host, ds4_gpu_recommended_working_set_size());
 }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static uint64_t ds41_expert_env_u64(const char *name, uint64_t fallback) {
+    const char *s = getenv(name);
+    char *end = NULL;
+    const unsigned long long v = s && s[0] ? strtoull(s, &end, 10) : 0;
+    return end && end != s && *end == '\0' ? (uint64_t)v : fallback;
+}
+
+static void ds41_release_expert_devices(void) {
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        ds41_expert_scratch *r = &g_ds41_expert_scratch[t];
+        ds4_gpu_tensor *tensors[] = {r->x, r->selected, r->weights, r->gate,
+                                     r->up, r->mid, r->down, r->out};
+        for (size_t i = 0; i < sizeof(tensors) / sizeof(tensors[0]); i++)
+            ds4_gpu_tensor_free(tensors[i]);
+        memset(r, 0, sizeof(*r));
+    }
+    memset(g_ds41_expert_tier, 0, sizeof(g_ds41_expert_tier));
+    g_ds41_expert_rows = 0;
+}
+
+/* Fill each expert device with whole routed layers, in layer order, keeping
+ * the routed-row scratch and a kernel workspace reserve free. Layers that do
+ * not fit keep streaming from SSD on the main device. */
+static bool ds41_install_expert_devices(ds4_engine *e) {
+    const ds4_weights *w = &e->weights;
+    if (!ds4_gpu_init_expert_devices(e->ds41_expert_devices, e->ds41_expert_device_count)) {
+        fprintf(stderr, "ds4: V4.1 expert device initialization failed\n");
+        return false;
+    }
+    uint64_t rows = ds41_expert_env_u64("DS4_V41_EXPERT_ROWS", 1024);
+    if (rows < 1) rows = 1;
+    if (rows > 8192) rows = 8192;
+    const uint64_t pairs = rows * DS4_N_EXPERT_USED;
+    const uint64_t sizes[8] = {
+        rows * DS4_N_EMBD * 4, pairs * 4, pairs * 4, pairs * DS4_N_FF_EXP * 4,
+        pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_FF_EXP * 4, pairs * DS4_N_EMBD * 4,
+        rows * DS4_N_EMBD * 4,
+    };
+    uint64_t scratch = 0;
+    for (int i = 0; i < 8; i++) scratch += sizes[i];
+    const uint64_t reserve = scratch +
+        (ds41_expert_env_u64("DS4_V41_EXPERT_RESERVE_MB", 1024) << 20);
+    ds4_tensor_range ranges[3 * DS4_MAX_LAYER];
+    int n_ranges = 0;
+    uint32_t il = 0, placed = 0, routed = 0;
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) routed += w->layer[i].ffn_gate_exps != NULL;
+    for (int t = 1; t <= e->ds41_expert_device_count; t++) {
+        const uint64_t free_bytes = ds4_gpu_tier_free_vram(t);
+        uint64_t room = free_bytes > reserve ? free_bytes - reserve : 0, bytes = 0;
+        uint32_t first = DS4_N_LAYER, last = 0;
+        for (; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+            const ds4_tensor *exps[3] = {l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps};
+            const uint64_t layer = exps[0]->bytes + exps[1]->bytes + exps[2]->bytes;
+            if (layer > room) break;
+            room -= layer;
+            bytes += layer;
+            for (int k = 0; k < 3; k++)
+                ranges[n_ranges++] = (ds4_tensor_range){exps[k]->abs_offset, exps[k]->bytes, t};
+            g_ds41_expert_tier[il] = (uint8_t)t;
+            if (first == DS4_N_LAYER) first = il;
+            last = il;
+            placed++;
+        }
+        if (first == DS4_N_LAYER) {
+            fprintf(stderr, "ds4: V4.1 expert device %d holds no layers (%.2f GiB free)\n",
+                    e->ds41_expert_devices[t - 1], (double)free_bytes / 1073741824.0);
+            continue;
+        }
+        fprintf(stderr, "ds4: V4.1 expert device %d: layers %u-%u routed experts (%.2f GiB)\n",
+                e->ds41_expert_devices[t - 1], first, last, (double)bytes / 1073741824.0);
+        ds41_expert_scratch *r = &g_ds41_expert_scratch[t];
+        ds4_gpu_tensor **slots[8] = {&r->x, &r->selected, &r->weights, &r->gate,
+                                     &r->up, &r->mid, &r->down, &r->out};
+        for (int i = 0; i < 8; i++) {
+            if (!(*slots[i] = ds4_gpu_tensor_alloc_ptr_on(t, sizes[i]))) {
+                fprintf(stderr, "ds4: V4.1 expert device %d scratch allocation failed\n",
+                        e->ds41_expert_devices[t - 1]);
+                return false;
+            }
+        }
+    }
+    g_ds41_expert_rows = (uint32_t)rows;
+    if (n_ranges && !ds4_gpu_expert_devices_load(ranges, n_ranges, reserve - scratch)) {
+        fprintf(stderr, "ds4: V4.1 expert device load failed\n");
+        return false;
+    }
+    fprintf(stderr, "ds4: V4.1 routed experts: %u of %u layers on expert devices, "
+                    "%u stream from SSD on device %d\n",
+            placed, routed, routed - placed, e->ds41_main_device);
+    return true;
+}
+#endif
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
@@ -71898,7 +72066,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
                 (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
-                 (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
+                 (!gpu_cfg || gpu_cfg->n_gpus <= 1 ||
+#ifndef DS4_ROCM_BUILD
+                  (opt->tp.role == DS4_TP_NONE && opt->ssd_streaming) ||
+#endif
+                  false)) ||
 #endif
                  false) &&
 #ifdef DS4_ROCM_BUILD
@@ -71910,13 +72082,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
-            fprintf(stderr, "ds4: V4.1 requires Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA); "
+            fprintf(stderr, "ds4: V4.1 requires Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA; "
+                            "extra CUDA expert devices need --ssd-streaming); "
                             "steering and legacy diagnostics "
                             "are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* The graph runs single-GPU on the first device; the others only
+         * hold routed experts, so the rest of startup sees one GPU. */
+        if (e->backend == DS4_BACKEND_CUDA && gpu_cfg && gpu_cfg->n_gpus > 1) {
+            e->ds41_main_device = gpu_cfg->device_indices[0];
+            for (int i = 1; i < gpu_cfg->n_gpus; i++)
+                e->ds41_expert_devices[e->ds41_expert_device_count++] = gpu_cfg->device_indices[i];
+            gpu_cfg = NULL;
+        }
+#endif
         /* The agent may change directory before creating its first session.
          * Engram readers reopen this file and check it against model.fd. */
         e->model_path = realpath(opt->model_path, NULL);
@@ -72566,6 +72749,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
         /* Single-tier path (every existing caller). Body is byte-equivalent
          * to pre-multi-GPU CLI main. */
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->ds41_expert_device_count) {
+            ds4_gpu_config main_cfg = {0};
+            main_cfg.n_gpus = 1;
+            main_cfg.device_indices[0] = e->ds41_main_device;
+            e->metal_ready = ds4_gpu_init_multi(&main_cfg) != 0;
+        } else
+#endif
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
@@ -73097,6 +73288,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 return 1;
             }
         }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->ds41_expert_device_count && !ds41_install_expert_devices(e)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -74096,6 +74294,9 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (e->ds41_expert_device_count) ds41_release_expert_devices();
+#endif
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);

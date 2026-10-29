@@ -285,6 +285,14 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+/* Initialized contexts. V4.1 expert devices extend g_gpu[] past the main
+ * graph's g_n_gpus, so the graph stays single-tier while tier-indexed
+ * helpers can still address the extra devices. */
+static int  g_n_tiers = 0;
+
+static inline int cuda_tier_count(void) {
+    return g_n_tiers > g_n_gpus ? g_n_tiers : g_n_gpus;
+}
 static bool g_device_is_spark = false;
 static struct {
     cudaMemPool_t pool;
@@ -755,12 +763,12 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
         return logical_tier == 0 && bytes <= CUDA_DSV41_SHARED_SCRATCH
             ? g_dsv41_shared.scratch : NULL;
     if (bytes == 0) return NULL;
-    if (g_n_gpus <= 1) {
+    if (g_n_gpus <= 1 && logical_tier <= 0) {
         return cuda_tmp_alloc(bytes, what);
     }
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
+    if (logical_tier < 0 || logical_tier >= cuda_tier_count()) {
         fprintf(stderr, "ds4: cuda_tmp_alloc_on: bad tier %d (n_gpus=%d, what=%s)\n",
-                logical_tier, g_n_gpus, what ? what : "?");
+                logical_tier, cuda_tier_count(), what ? what : "?");
         return NULL;
     }
     ds4_gpu_ctx *ctx = &g_gpu[logical_tier];
@@ -940,7 +948,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
  *
  * Added for multi-GPU execution (multi-GPU execution), sub-area 1. */
 static inline cublasHandle_t cuda_cublas_main_for_tier(int logical_tier) {
-    if (g_n_gpus <= 1) {
+    if (g_n_gpus <= 1 && logical_tier <= 0) {
         return (cublasHandle_t)g_gpu[0].cublas;
     }
     /* The executing device is authoritative: GLM per-layer switching runs
@@ -949,13 +957,13 @@ static inline cublasHandle_t cuda_cublas_main_for_tier(int logical_tier) {
      * requested tier, so this is behavior-preserving there. */
     int cur_dev = -1;
     if (cudaGetDevice(&cur_dev) == cudaSuccess) {
-        for (int t = 0; t < g_n_gpus; t++) {
+        for (int t = 0; t < cuda_tier_count(); t++) {
             if (g_gpu[t].device_id == cur_dev) {
                 return (cublasHandle_t)g_gpu[t].cublas;
             }
         }
     }
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
+    if (logical_tier < 0 || logical_tier >= cuda_tier_count()) {
         return (cublasHandle_t)g_gpu[0].cublas;
     }
     return (cublasHandle_t)g_gpu[logical_tier].cublas;
@@ -1409,7 +1417,7 @@ static uint64_t g_support_host_size = 0;
 static uint64_t g_support_offset_bias = 0;
 
 extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    if (logical_tier < 0 || logical_tier >= cuda_tier_count()) return 0;
     int prev = -1;
     if (cudaGetDevice(&prev) != cudaSuccess) prev = -1;
     if (cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) return 0;
@@ -1433,16 +1441,16 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
                                             uint64_t bytes,
                                             int logical_tier,
                                             const char *label) {
-    if (g_n_gpus <= 1) {
+    if (g_n_gpus <= 1 && logical_tier <= 0) {
         return cuda_model_range_ptr(model_map, offset, bytes, label);
     }
     if (g_support_host_base && model_map == g_support_host_base) {
         offset += g_support_offset_bias;
     }
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) {
+    if (logical_tier < 0 || logical_tier >= cuda_tier_count()) {
         fprintf(stderr,
             "ds4: cuda_resolve_weight_ptr: bad tier %d (n_gpus=%d, label=%s)\n",
-            logical_tier, g_n_gpus, label ? label : "?");
+            logical_tier, cuda_tier_count(), label ? label : "?");
         return NULL;
     }
     const int physical_device = g_gpu[logical_tier].device_id;
@@ -2748,61 +2756,49 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
-extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
-    if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
-    cuda_xdev_env_refresh();
-    cuda_decode_dispatch_env_refresh();
-    g_current_logical_tier = -1;
-
-    /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
-     * partial state on failure. We publish `i + 1` BEFORE allocating any
-     * resources for context `i`, so even if (e.g.) stream creation
-     * succeeds but event creation fails, cleanup still walks device `i`
-     * and destroys the stream. ds4_gpu_cleanup is null-safe per field —
-     * partial state is OK. */
-    for (int i = 0; i < cfg->n_gpus; i++) {
-        ds4_gpu_ctx *c = &g_gpu[i];
-        c->device_id = cfg->device_indices[i];
-        if (c->device_id < 0) return 0;
-        /* Publish the in-progress device id so cleanup can target it on
-         * any later failure. cudaSetDevice is also required before
-         * cleanup's cudaEventDestroy / cudaStreamDestroy / cublasDestroy
-         * calls hit the right context. */
-        g_n_gpus = i + 1;
-        if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
-        cuda_scratch_retention_init(i);
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
-            if (i == 0) g_device_is_spark =
-                prop.integrated && prop.major == 12 && prop.minor == 1;
-            fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
-                    prop.name, prop.major, prop.minor, c->device_id);
-        }
-        /* Per-device stream. */
-        cudaStream_t s = NULL;
-        if (!cuda_ok(cudaStreamCreate(&s), "init stream")) return 0;
-        c->stream = (void *)s;
-        /* Per-device boundary event (reusable, no timing). */
-        cudaEvent_t ev = NULL;
-        if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
-                      "init event")) return 0;
-        c->boundary_event = (void *)ev;
-        /* Per-device cuBLAS handle. */
-        cublasHandle_t h = NULL;
-        if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
-        c->cublas = (void *)h;
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(h, math_mode);
-        c->cublas_ready = 1;
-        c->budget_bytes = cfg->vram_bytes[i];
-        c->used_bytes   = 0;
-        c->scratch      = NULL;
-        c->scratch_bytes = 0;
+/* Per-device context: stream, boundary event, cuBLAS handle and scratch
+ * retention for g_gpu[tier], whose device_id the caller has set. The caller
+ * publishes the tier count first so ds4_gpu_cleanup() can unwind a partial
+ * context. */
+static int cuda_tier_ctx_init(int tier, uint64_t budget_bytes) {
+    ds4_gpu_ctx *c = &g_gpu[tier];
+    if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
+    cuda_scratch_retention_init(tier);
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+        if (tier == 0) g_device_is_spark =
+            prop.integrated && prop.major == 12 && prop.minor == 1;
+        fprintf(stderr, "ds4: CUDA %s initialized on %s (sm_%d%d) dev=%d\n",
+                tier < g_n_gpus ? "backend" : "expert device",
+                prop.name, prop.major, prop.minor, c->device_id);
     }
+    /* Per-device stream. */
+    cudaStream_t s = NULL;
+    if (!cuda_ok(cudaStreamCreate(&s), "init stream")) return 0;
+    c->stream = (void *)s;
+    /* Per-device boundary event (reusable, no timing). */
+    cudaEvent_t ev = NULL;
+    if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+                  "init event")) return 0;
+    c->boundary_event = (void *)ev;
+    /* Per-device cuBLAS handle. */
+    cublasHandle_t h = NULL;
+    if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
+    c->cublas = (void *)h;
+    const cublasMath_t math_mode =
+        (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+            ? CUBLAS_DEFAULT_MATH
+            : CUBLAS_TF32_TENSOR_OP_MATH;
+    (void)cublasSetMathMode(h, math_mode);
+    c->cublas_ready = 1;
+    c->budget_bytes = budget_bytes;
+    c->used_bytes   = 0;
+    c->scratch      = NULL;
+    c->scratch_bytes = 0;
+    return 1;
+}
 
+static void cuda_peer_matrix_init(int n) {
     /* NxN peer-access matrix.
      *
      * Driver semantics: cudaDeviceCanAccessPeer + cudaDeviceEnablePeerAccess
@@ -2818,8 +2814,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
      * activation-sized copies still corrupt. On any failure the entry
      * stays at 0 and cross-device copies fall back to the pinned-host
      * bounce path automatically. */
-    for (int i = 0; i < g_n_gpus; i++) {
-        for (int j = 0; j < g_n_gpus; j++) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
             if (i == j) { g_gpu_peer_ok[i][j] = 1; continue; }
             int can = 0;
             (void)cudaDeviceCanAccessPeer(&can, g_gpu[i].device_id,
@@ -2937,6 +2933,33 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             }
         }
     }
+}
+
+extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
+    if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
+    cuda_xdev_env_refresh();
+    cuda_decode_dispatch_env_refresh();
+    g_current_logical_tier = -1;
+
+    /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
+     * partial state on failure. We publish `i + 1` BEFORE allocating any
+     * resources for context `i`, so even if (e.g.) stream creation
+     * succeeds but event creation fails, cleanup still walks device `i`
+     * and destroys the stream. ds4_gpu_cleanup is null-safe per field —
+     * partial state is OK. */
+    for (int i = 0; i < cfg->n_gpus; i++) {
+        ds4_gpu_ctx *c = &g_gpu[i];
+        c->device_id = cfg->device_indices[i];
+        if (c->device_id < 0) return 0;
+        /* Publish the in-progress device id so cleanup can target it on
+         * any later failure. cudaSetDevice is also required before
+         * cleanup's cudaEventDestroy / cudaStreamDestroy / cublasDestroy
+         * calls hit the right context. */
+        g_n_gpus = i + 1;
+        if (!cuda_tier_ctx_init(i, cfg->vram_bytes[i])) return 0;
+    }
+
+    cuda_peer_matrix_init(g_n_gpus);
 
     g_cublas_ready = 1;
     return 1;
@@ -2950,6 +2973,179 @@ extern "C" int ds4_gpu_init(void) {
     return ds4_gpu_init_multi(&cfg);
 }
 
+/* V4.1 expert devices: extra CUDA devices holding whole routed-expert layers.
+ * The graph stays single-tier on tier 0; expert tiers follow it in g_gpu[] so
+ * tensors, scratch and strict weight lookups can address them. */
+extern "C" int ds4_gpu_init_expert_devices(const int *device_ids, int n) {
+    if (g_n_gpus != 1 || g_n_tiers > g_n_gpus || !device_ids ||
+        n < 1 || n >= DS4_MAX_GPUS) return 0;
+    for (int i = 0; i < n; i++) {
+        if (device_ids[i] < 0) return 0;
+        for (int t = 0; t <= i; t++)
+            if (g_gpu[t].device_id == device_ids[i]) return 0;
+        g_gpu[1 + i].device_id = device_ids[i];
+        g_n_tiers = 2 + i;
+        if (!cuda_tier_ctx_init(1 + i, 0)) return 0;
+    }
+    cuda_peer_matrix_init(g_n_tiers);
+    g_current_logical_tier = -1;
+    return cuda_ok(cudaSetDevice(g_gpu[0].device_id), "expert devices restore device");
+}
+
+typedef struct {
+    int tier;
+    const ds4_tensor_range *ranges;
+    int n_ranges;
+    char *slab;
+    std::atomic<uint64_t> *done;
+    std::atomic<int> *finished;
+    int ok;
+} cuda_expert_load_job;
+
+static void *cuda_expert_load_thread(void *arg) {
+    cuda_expert_load_job *j = (cuda_expert_load_job *)arg;
+    const uint64_t chunk = UINT64_C(64) << 20;
+    void *stage[2] = {NULL, NULL};
+    cudaEvent_t ev[2] = {NULL, NULL};
+    cudaStream_t stream = NULL;
+    bool ok = cudaSetDevice(g_gpu[j->tier].device_id) == cudaSuccess &&
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+    for (int k = 0; ok && k < 2; k++)
+        ok = cudaMallocHost(&stage[k], chunk) == cudaSuccess &&
+             cudaEventCreateWithFlags(&ev[k], cudaEventDisableTiming) == cudaSuccess;
+    /* Double buffered: the read into one stage overlaps the copy of the other. */
+    uint64_t dst = 0;
+    int k = 0;
+    for (int i = 0; ok && i < j->n_ranges; i++) {
+        const ds4_tensor_range *r = &j->ranges[i];
+        if (r->target_device != j->tier) continue;
+        for (uint64_t off = 0; ok && off < r->bytes; off += chunk, k ^= 1) {
+            const uint64_t n = std::min(chunk, r->bytes - off);
+            ok = cudaEventSynchronize(ev[k]) == cudaSuccess &&
+                 cuda_pread_full(g_model_fd, stage[k], n, r->source_offset + off) &&
+                 cudaMemcpyAsync(j->slab + dst, stage[k], (size_t)n,
+                                 cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                 cudaEventRecord(ev[k], stream) == cudaSuccess;
+            dst += n;
+            j->done->fetch_add(n);
+        }
+    }
+    if (stream && cudaStreamSynchronize(stream) != cudaSuccess) ok = false;
+    for (int s = 0; s < 2; s++) {
+        if (ev[s]) (void)cudaEventDestroy(ev[s]);
+        if (stage[s]) (void)cudaFreeHost(stage[s]);
+    }
+    if (stream) (void)cudaStreamDestroy(stream);
+    (void)cudaGetLastError();
+    j->ok = ok;
+    j->finished->fetch_add(1);
+    return NULL;
+}
+
+/* Load routed-expert ranges onto expert tiers, one reader thread per device,
+ * and register them for strict per-device lookups. Each range's
+ * target_device is a logical tier; reserve_bytes stays free on each device
+ * for the expert scratch and kernel workspaces. */
+extern "C" int ds4_gpu_expert_devices_load(const ds4_tensor_range *ranges, int n_ranges,
+                                           uint64_t reserve_bytes) {
+    if (g_model_fd < 0 || !g_model_host_base || !ranges || n_ranges <= 0) return 0;
+    cuda_expert_load_job jobs[DS4_MAX_GPUS];
+    pthread_t threads[DS4_MAX_GPUS];
+    bool started[DS4_MAX_GPUS] = {};
+    std::atomic<uint64_t> done{0};
+    std::atomic<int> finished{0};
+    uint64_t total = 0;
+    int running = 0;
+    bool ok = true;
+    memset(jobs, 0, sizeof(jobs));
+    for (int t = 1; ok && t < g_n_tiers; t++) {
+        uint64_t bytes = 0;
+        for (int i = 0; i < n_ranges; i++) {
+            if (ranges[i].target_device != t) continue;
+            if (ranges[i].source_offset > g_model_registered_size ||
+                ranges[i].bytes > g_model_registered_size - ranges[i].source_offset) return 0;
+            bytes += ranges[i].bytes;
+        }
+        if (!bytes) continue;
+        const int dev = g_gpu[t].device_id;
+        if (g_dev_cache[dev].present) return 0;
+        size_t free_b = 0, total_b = 0;
+        void *slab = NULL;
+        WITH_DEVICE(dev) {
+            if (!cuda_ok(cudaMemGetInfo(&free_b, &total_b), "expert device memory")) {
+                ok = false;
+            } else if (bytes + reserve_bytes > free_b) {
+                fprintf(stderr, "ds4: expert device %d needs %.2f GiB + %.2f GiB reserve; "
+                                "%.2f GiB free\n", dev, (double)bytes / 1073741824.0,
+                        (double)reserve_bytes / 1073741824.0, (double)free_b / 1073741824.0);
+                ok = false;
+            } else {
+                ok = cuda_ok(cudaMalloc(&slab, (size_t)bytes), "expert device slab");
+            }
+        }
+        if (!ok) break;
+        g_dev_cache[dev].base = slab;
+        g_dev_cache[dev].bytes = bytes;
+        g_dev_cache[dev].present = 1;
+        jobs[t].tier = t;
+        jobs[t].ranges = ranges;
+        jobs[t].n_ranges = n_ranges;
+        jobs[t].slab = (char *)slab;
+        jobs[t].done = &done;
+        jobs[t].finished = &finished;
+        total += bytes;
+    }
+    const double t0 = cuda_wall_sec();
+    for (int t = 1; ok && t < g_n_tiers; t++) {
+        if (!jobs[t].slab) continue;
+        started[t] = pthread_create(&threads[t], NULL, cuda_expert_load_thread, &jobs[t]) == 0;
+        if (!started[t]) ok = false;
+        else running++;
+    }
+    const bool tty = isatty(2);
+    while (finished.load() < running) {
+        if (tty) {
+            fprintf(stderr, "\rds4: loading V4.1 experts onto expert devices %.2f / %.2f GiB",
+                    (double)done.load() / 1073741824.0, (double)total / 1073741824.0);
+        }
+        usleep(250000);
+    }
+    for (int t = 1; t < g_n_tiers; t++) {
+        if (!started[t]) continue;
+        (void)pthread_join(threads[t], NULL);
+        if (!jobs[t].ok) ok = false;
+    }
+    if (tty && running) fputc('\n', stderr);
+    if (ok) {
+        for (int t = 1; t < g_n_tiers; t++) {
+            if (!jobs[t].slab) continue;
+            uint64_t dst = 0;
+            for (int i = 0; i < n_ranges; i++) {
+                if (ranges[i].target_device != t) continue;
+                cache_range_entry ent;
+                ent.source_offset = ranges[i].source_offset;
+                ent.bytes = ranges[i].bytes;
+                ent.device_id = g_gpu[t].device_id;
+                ent.device_ptr = jobs[t].slab + dst;
+                g_cache_ranges.push_back(ent);
+                dst += ranges[i].bytes;
+            }
+        }
+        std::sort(g_cache_ranges.begin(), g_cache_ranges.end(),
+                  [](const cache_range_entry &a, const cache_range_entry &b) {
+                      if (a.source_offset != b.source_offset)
+                          return a.source_offset < b.source_offset;
+                      return a.device_id < b.device_id;
+                  });
+        const double secs = cuda_wall_sec() - t0;
+        fprintf(stderr, "ds4: loaded %.2f GiB of V4.1 experts onto %d expert device(s) "
+                        "in %.1fs (%.2f GiB/s)\n", (double)total / 1073741824.0, running,
+                secs, secs > 0 ? (double)total / 1073741824.0 / secs : 0.0);
+    }
+    if (!cuda_ok(cudaSetDevice(g_gpu[0].device_id), "expert load restore device")) ok = false;
+    return ok;
+}
+
 extern "C" void ds4_gpu_cleanup(void) {
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     ds4_gpu_tp_shutdown();
@@ -2959,7 +3155,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
      * slabs, per-pair bounce buffers. */
-    for (int i = 0; i < g_n_gpus; i++) {
+    for (int i = 0; i < cuda_tier_count(); i++) {
         ds4_gpu_ctx *c = &g_gpu[i];
         (void)cudaSetDevice(c->device_id);
         if (i == 0) cuda_dsv41_shared_free();
@@ -3012,6 +3208,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
+    g_n_tiers = 0;
     g_device_is_spark = false;
     g_cublas_ready = 0;
 
@@ -3095,7 +3292,7 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
                                        uint64_t bytes) {
     if (!t) return 1;
-    if (device_id < 0 || device_id >= g_n_gpus) return 2;
+    if (device_id < 0 || device_id >= cuda_tier_count()) return 2;
     if (bytes == 0) bytes = 1;
     int ok = 0;
     WITH_DEVICE(g_gpu[device_id].device_id) {
@@ -3175,7 +3372,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
  * bytes) is byte-equivalent. Single-tier callers MAY remain on the
  * legacy 1-arg helper; new multi-tier callers in ds4.c use _ptr_on. */
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
-    if (tier < 0 || tier >= g_n_gpus) {
+    if (tier < 0 || tier >= cuda_tier_count()) {
         fprintf(stderr,
             "ds4: ds4_gpu_tensor_alloc_ptr_on: bad tier %d (n_gpus=%d)\n",
             tier, g_n_gpus);
@@ -3201,7 +3398,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes)
  * unless another device touches it. Stamping tier matches the home
  * device for free-time accounting. */
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
-    if (tier < 0 || tier >= g_n_gpus) {
+    if (tier < 0 || tier >= cuda_tier_count()) {
         fprintf(stderr,
             "ds4: ds4_gpu_tensor_alloc_managed_on: bad tier %d (n_gpus=%d)\n",
             tier, g_n_gpus);
@@ -4235,7 +4432,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
  * Added for multi-GPU placement scaffolding (multi-GPU CLI); first executed by
  * multi-GPU execution (follow-up). */
 extern "C" int ds4_gpu_set_current_device(int logical_tier) {
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
+    if (logical_tier < 0 || logical_tier >= cuda_tier_count()) return -1;
     if (!g_cuda_no_setdevice_cache && g_current_logical_tier == logical_tier) {
         return 0;
     }
@@ -4253,7 +4450,7 @@ extern "C" int ds4_gpu_set_current_device(int logical_tier) {
  * stream. Async — no host sync. Falls back to a plain switch when the
  * device does not change. */
 extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
-    if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
+    if (logical_tier < 0 || logical_tier >= cuda_tier_count()) return -1;
     static cudaEvent_t fence_ev[DS4_MAX_GPUS];
     /* Resolve the ACTUAL current device: WITH_DEVICE blocks and direct
      * cudaSetDevice calls can leave g_current_logical_tier stale, and a
@@ -4261,7 +4458,7 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     int cur_dev = -1;
     (void)cudaGetDevice(&cur_dev);
     int prev = -1;
-    for (int t = 0; t < g_n_gpus; t++) {
+    for (int t = 0; t < cuda_tier_count(); t++) {
         if (g_gpu[t].device_id == cur_dev) { prev = t; break; }
     }
     if (getenv("DS4_GLM_FENCE_TRACE")) {
@@ -26055,8 +26252,11 @@ static int routed_moe_launch(
     const int mxfp4_path = (gate_type == 39u && down_type == 39u);
     if (!q4k_path && !iq2_path && !mxfp4_path) return 0;
 
-    /* Resident support models must not use the target model's SSD cache. */
-    const bool stream_model = g_ssd_streaming_mode && model_map == g_model_fd_host_base;
+    /* Resident support models must not use the target model's SSD cache, nor
+     * may layers resident on a V4.1 expert device. */
+    const int out_tier = ds4_tensor_device_idx(out);
+    const bool stream_model = g_ssd_streaming_mode && model_map == g_model_fd_host_base &&
+        out_tier == 0;
     ds4_gpu_tensor local_ids = {}, local_weights = {};
     /* Intermediate split: every rank holds half of every expert, so all
      * assignments are computed here with half the intermediate rows and the
@@ -26157,7 +26357,7 @@ static int routed_moe_launch(
     /* The aligned artifacts replace the raw expert tensors on integrated
      * CUDA systems.  Route both prefill and decode before resolving a raw
      * pointer, otherwise the fallback cache would duplicate tens of GiB. */
-    if (iq2_path && !stream_model &&
+    if (iq2_path && !stream_model && out_tier == 0 &&
         cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled()) {
         const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
         const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
@@ -26543,10 +26743,11 @@ static int routed_moe_launch(
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
-    /* V4.1's short TP prefills need scalar-row arithmetic. Keep existing
-     * multi-GPU batching dispatch unchanged for other model geometries. */
-    const bool exact_owned_rows = owned_filtered && expert_in_dim == 5120u &&
-        expert_mid_dim == 2304u;
+    /* V4.1's short TP prefills need scalar-row arithmetic, and so do layers
+     * on a V4.1 expert device, to match the streamed path they replace. Keep
+     * existing multi-GPU batching dispatch unchanged for other geometries. */
+    const bool exact_owned_rows = (owned_filtered || out_tier != 0) &&
+        expert_in_dim == 5120u && expert_mid_dim == 2304u;
     const bool small_exact_batch = iq2_path && (use_stream_selected_cache || exact_owned_rows) &&
         n_tokens <= 8u && (n_expert == 3u || n_expert == 6u) &&
         getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
