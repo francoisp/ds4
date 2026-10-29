@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <atomic>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
@@ -555,6 +556,7 @@ static void *g_stream_selected_stage[4];
 static cudaEvent_t g_stream_selected_stage_event[4];
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
+static void cuda_ssd_read_release(void);
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -3207,6 +3209,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
+    cuda_ssd_read_release();
     g_n_gpus = 0;
     g_n_tiers = 0;
     g_device_is_spark = false;
@@ -29197,6 +29200,202 @@ static int cuda_stream_selected_ranges_valid(
            down_bytes <= table->model_size - table->down_offset;
 }
 
+/* Parallel SSD expert reads. A read is CPU-bound in the kernel (page cache or
+ * filesystem copies), so one thread caps streamed decode well below what the
+ * storage and PCIe can deliver. A small persistent pool splits a request's
+ * ranges into chunks; every reader, including the caller, has its own pinned
+ * stages and upload stream. DS4_CUDA_SSD_READ_THREADS=1 keeps the serial path. */
+enum { CUDA_SSD_READ_MAX_THREADS = 16 };
+
+struct cuda_ssd_read_job {
+    char *destination;
+    uint64_t offset, bytes;
+};
+
+struct cuda_ssd_reader {
+    void *raw[2];
+    char *stage[2];
+    cudaEvent_t ready[2];
+    cudaStream_t stream;
+    uint64_t stage_bytes;
+    int device;
+};
+
+static struct {
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t wake = PTHREAD_COND_INITIALIZER, done = PTHREAD_COND_INITIALIZER;
+    pthread_t threads[CUDA_SSD_READ_MAX_THREADS];
+    int n_threads = 0, running = 0;
+    uint64_t generation = 0;
+    bool stop = false;
+    const cuda_ssd_read_job *jobs = NULL;
+    size_t n_jobs = 0;
+    const void *model_map = NULL;
+    uint64_t model_size = 0;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    cuda_ssd_reader readers[CUDA_SSD_READ_MAX_THREADS];
+} g_ssd_read;
+
+static int cuda_ssd_read_threads(void) {
+    static int threads = 0;
+    if (threads) return threads;
+    const char *env = getenv("DS4_CUDA_SSD_READ_THREADS");
+    if (env && env[0]) {
+        threads = atoi(env);
+    } else {
+        cpu_set_t set;
+        threads = sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 1;
+        if (threads > 8) threads = 8;
+    }
+    if (threads < 1) threads = 1;
+    if (threads > CUDA_SSD_READ_MAX_THREADS) threads = CUDA_SSD_READ_MAX_THREADS;
+    return threads;
+}
+
+static uint64_t cuda_ssd_read_chunk_bytes(void) {
+    return UINT64_C(8) << 20;
+}
+
+static void cuda_ssd_reader_free(cuda_ssd_reader *r) {
+    for (int k = 0; k < 2; k++) {
+        if (r->ready[k]) (void)cudaEventDestroy(r->ready[k]);
+        if (r->raw[k]) (void)cudaFreeHost(r->raw[k]);
+    }
+    if (r->stream) (void)cudaStreamDestroy(r->stream);
+    memset(r, 0, sizeof(*r));
+}
+
+static bool cuda_ssd_reader_ready(cuda_ssd_reader *r, uint64_t stage_bytes) {
+    const int device = g_gpu[0].device_id;
+    if (cudaSetDevice(device) != cudaSuccess) return false;
+    if (r->stream && r->device == device && r->stage_bytes >= stage_bytes) return true;
+    cuda_ssd_reader_free(r);
+    r->device = device;
+    r->stage_bytes = stage_bytes;
+    bool ok = cudaStreamCreateWithFlags(&r->stream, cudaStreamNonBlocking) == cudaSuccess;
+    for (int k = 0; ok && k < 2; k++) {
+        /* Aligning the stage start must not shrink its usable size. */
+        ok = cudaMallocHost(&r->raw[k], (size_t)(stage_bytes + g_model_direct_align)) == cudaSuccess &&
+             cudaEventCreateWithFlags(&r->ready[k], cudaEventDisableTiming) == cudaSuccess;
+        if (ok) r->stage[k] = (char *)cuda_align_ptr(r->raw[k], g_model_direct_align);
+    }
+    if (!ok) {
+        (void)cudaGetLastError();
+        cuda_ssd_reader_free(r);
+    }
+    return ok;
+}
+
+/* Claim chunks until the request is exhausted, overlapping each read with the
+ * previous chunk's upload, then drain this reader's stream. */
+static void cuda_ssd_read_work(cuda_ssd_reader *r) {
+    auto &p = g_ssd_read;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    if (!cuda_ssd_reader_ready(r, cuda_ssd_read_chunk_bytes() + 2u * align)) {
+        p.failed = true;
+        return;
+    }
+    /* A rejected direct read closes the descriptor it was given. */
+    int direct_fd = g_model_direct_fd >= 0 ? dup(g_model_direct_fd) : -1;
+    int k = 0;
+    for (;;) {
+        const size_t i = p.next.fetch_add(1);
+        if (i >= p.n_jobs || p.failed) break;
+        const cuda_ssd_read_job &job = p.jobs[i];
+        const char *payload = NULL;
+        if (cudaEventSynchronize(r->ready[k]) != cudaSuccess ||
+            !cuda_model_stage_read_from(g_model_fd, &direct_fd, g_model_direct_align,
+                                        g_model_file_size, r->stage[k], r->stage_bytes,
+                                        job.offset, job.bytes, &payload) ||
+            cudaMemcpyAsync(job.destination, payload, (size_t)job.bytes,
+                            cudaMemcpyHostToDevice, r->stream) != cudaSuccess ||
+            cudaEventRecord(r->ready[k], r->stream) != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA parallel SSD read failed at offset %llu: %s\n",
+                    (unsigned long long)job.offset, strerror(errno));
+            p.failed = true;
+            break;
+        }
+        cuda_model_drop_file_pages(job.offset, job.bytes);
+        cuda_model_discard_source_pages(p.model_map, p.model_size, job.offset, job.bytes);
+        k ^= 1;
+    }
+    if (direct_fd >= 0) (void)close(direct_fd);
+    if (cudaStreamSynchronize(r->stream) != cudaSuccess) p.failed = true;
+    (void)cudaGetLastError();
+}
+
+static void *cuda_ssd_read_thread(void *arg) {
+    cuda_ssd_reader *r = (cuda_ssd_reader *)arg;
+    auto &p = g_ssd_read;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&p.mu);
+    for (;;) {
+        while (!p.stop && p.generation == seen) pthread_cond_wait(&p.wake, &p.mu);
+        if (p.stop) break;
+        seen = p.generation;
+        pthread_mutex_unlock(&p.mu);
+        cuda_ssd_read_work(r);
+        pthread_mutex_lock(&p.mu);
+        if (--p.running == 0) pthread_cond_signal(&p.done);
+    }
+    pthread_mutex_unlock(&p.mu);
+    return NULL;
+}
+
+static void cuda_ssd_read_release(void) {
+    auto &p = g_ssd_read;
+    pthread_mutex_lock(&p.mu);
+    p.stop = true;
+    pthread_cond_broadcast(&p.wake);
+    pthread_mutex_unlock(&p.mu);
+    for (int i = 0; i < p.n_threads; i++) (void)pthread_join(p.threads[i], NULL);
+    for (int i = 0; i < CUDA_SSD_READ_MAX_THREADS; i++) cuda_ssd_reader_free(&p.readers[i]);
+    p.n_threads = 0;
+    p.stop = false;
+}
+
+/* Read every range to its device destination. Returns only after all uploads
+ * have completed, so the caller may publish or release the destinations. */
+static int cuda_ssd_read_parallel(const std::vector<cuda_ssd_read_job> &ranges,
+                                  const void *model_map, uint64_t model_size) {
+    auto &p = g_ssd_read;
+    std::vector<cuda_ssd_read_job> jobs;
+    const uint64_t chunk = cuda_ssd_read_chunk_bytes();
+    for (const auto &range : ranges) {
+        for (uint64_t done = 0; done < range.bytes; done += chunk) {
+            const uint64_t n = std::min(chunk, range.bytes - done);
+            jobs.push_back({range.destination + done, range.offset + done, n});
+        }
+    }
+    if (jobs.empty()) return 1;
+    while (p.n_threads < cuda_ssd_read_threads() - 1) {
+        if (pthread_create(&p.threads[p.n_threads], NULL, cuda_ssd_read_thread,
+                           &p.readers[p.n_threads + 1]) != 0) break;
+        p.n_threads++;
+    }
+    pthread_mutex_lock(&p.mu);
+    p.jobs = jobs.data();
+    p.n_jobs = jobs.size();
+    p.model_map = model_map;
+    p.model_size = model_size;
+    p.next = 0;
+    p.failed = false;
+    /* Every pool thread wakes on a new generation, so all of them report. */
+    p.running = jobs.size() > 1 ? p.n_threads : 0;
+    if (p.running) {
+        p.generation++;
+        pthread_cond_broadcast(&p.wake);
+    }
+    pthread_mutex_unlock(&p.mu);
+    cuda_ssd_read_work(&p.readers[0]);
+    pthread_mutex_lock(&p.mu);
+    while (p.running) pthread_cond_wait(&p.done, &p.mu);
+    pthread_mutex_unlock(&p.mu);
+    (void)cudaSetDevice(g_gpu[0].device_id);
+    return !p.failed;
+}
+
 /* The staging ring spans all misses in a request. Drain it before publishing
  * the request, or before any error return can release/reuse its destinations. */
 struct cuda_stream_upload_batch {
@@ -29335,6 +29534,9 @@ static int cuda_stream_selected_cache_begin_load(
          * Keep both orders available for comparisons and failure tests. */
         const bool ordered = getenv("DS4_CUDA_DISABLE_SSD_SORT_SELECTED_READS") == NULL &&
             (order_reads || getenv("DS4_CUDA_SSD_SORT_SELECTED_READS") != NULL);
+        /* Parallel reads queue every miss and publish after all uploads. */
+        const bool parallel = cuda_ssd_read_threads() > 1 && g_model_fd >= 0 &&
+            (g_model_fd_host_base == NULL || table->model_map == g_model_fd_host_base);
         struct selected_copy {
             char *destination;
             uint64_t offset, bytes;
@@ -29342,10 +29544,12 @@ static int cuda_stream_selected_cache_begin_load(
         };
         std::vector<size_t> order, pending;
         std::vector<selected_copy> copies;
-        if (ordered) {
-            order.reserve(unique.size());
+        if (ordered || parallel) {
             pending.reserve(unique.size());
             copies.reserve(unique.size() * 3u);
+        }
+        if (ordered) {
+            order.reserve(unique.size());
             for (size_t i = 0; i < unique.size(); i++) order.push_back(i);
             std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
                 return unique[a] < unique[b];
@@ -29377,7 +29581,7 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t gate = table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
-            if (ordered) {
+            if (ordered || parallel) {
                 copies.push_back({cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                     gate, table->gate_expert_bytes, 0});
                 copies.push_back({cache.up_ptr + (uint64_t)victim * table->gate_expert_bytes,
@@ -29399,9 +29603,9 @@ static int cuda_stream_selected_cache_begin_load(
                     return 0;
             }
             slot = {gate, up, down, stamp};
-            /* Ordered copies are still pending. Protect their slots, but do
+            /* Queued copies are still pending. Protect their slots, but do
              * not advertise a cache hit until every upload has completed. */
-            if (!ordered) g_stream_expert_by_gate[gate] = victim;
+            if (!ordered && !parallel) g_stream_expert_by_gate[gate] = victim;
             slots[i] = (int32_t)victim;
         }
         if (ordered) {
@@ -29416,8 +29620,21 @@ static int cuda_stream_selected_cache_begin_load(
                     copies[merged - 1u].bytes += copy.bytes;
                 else copies[merged++] = copy;
             }
+            copies.resize(merged);
+        }
+        if (parallel) {
+            std::vector<cuda_ssd_read_job> ranges;
+            ranges.reserve(copies.size());
+            for (const auto &copy : copies)
+                ranges.push_back({copy.destination, copy.offset, copy.bytes});
+            if (!cuda_ssd_read_parallel(ranges, table->model_map, table->model_size)) {
+                for (size_t index : pending)
+                    g_stream_expert_slots[slots[index]].used = 0;
+                return 0;
+            }
+        } else if (ordered) {
             uint64_t complete_until[3] = {0, 0, 0};
-            for (size_t i = 0; i < merged; i++) {
+            for (size_t i = 0; i < copies.size(); i++) {
                 const auto &copy = copies[i];
                 uploads.active = true;
                 if (!cuda_model_copy_to_device_streamed(copy.destination,
@@ -29442,7 +29659,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
         }
         if (!uploads.finish()) return 0;
-        if (ordered) for (size_t i : pending) {
+        if (ordered || parallel) for (size_t i : pending) {
             const uint32_t slot = (uint32_t)slots[i];
             g_stream_expert_by_gate[g_stream_expert_slots[slot].gate] = slot;
         }
