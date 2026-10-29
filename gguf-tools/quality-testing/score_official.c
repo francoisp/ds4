@@ -637,6 +637,50 @@ static int local_top_ids(const float *logits, int n_vocab, int *ids, int k) {
     return n;
 }
 
+/* KL(official || local) over the official top-N tokens plus one bucket for
+ * the rest of the vocabulary. Merging the tail can only lower the estimate,
+ * so this is a lower bound on the full-vocabulary divergence. */
+static double topn_kl(const int *ids, const double *api_lp, const double *local_lp, int n) {
+    double kl = 0.0, api_mass = 0.0, local_mass = 0.0;
+    for (int i = 0; i < n; i++) {
+        bool dup = false;
+        for (int j = 0; j < i && !dup; j++) dup = ids[j] == ids[i];
+        if (dup) continue;
+        const double p = exp(api_lp[i]);
+        kl += p * (api_lp[i] - local_lp[i]);
+        api_mass += p;
+        local_mass += exp(local_lp[i]);
+    }
+    const double api_rest = 1.0 - api_mass;
+    if (api_rest > 1e-12) {
+        const double local_rest = local_mass < 1.0 ? 1.0 - local_mass : 1e-12;
+        kl += api_rest * log(api_rest / (local_rest > 1e-12 ? local_rest : 1e-12));
+    }
+    return kl;
+}
+
+typedef struct {
+    double *v;
+    size_t n, cap;
+} kl_samples;
+
+static bool kl_push(kl_samples *s, double kl) {
+    if (s->n == s->cap) {
+        const size_t cap = s->cap ? s->cap * 2 : 1024;
+        double *v = realloc(s->v, cap * sizeof(*v));
+        if (!v) return false;
+        s->v = v;
+        s->cap = cap;
+    }
+    s->v[s->n++] = kl;
+    return true;
+}
+
+static int cmp_double(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
 static bool id_in_top(const int *ids, int n, int id) {
     for (int i = 0; i < n; i++) {
         if (ids[i] == id) return true;
@@ -944,6 +988,7 @@ int main(int argc, char **argv) {
     long first_matches = 0;
     long total_api_ref_tokens = 0;
     api_metrics total_api = {0};
+    kl_samples kl = {0};
     char err[256];
 
     while (fgets(line, sizeof(line), mf)) {
@@ -1112,6 +1157,11 @@ int main(int argc, char **argv) {
                         }
                     }
 
+                    if (mapped_n > 0 &&
+                        !kl_push(&kl, topn_kl(mapped_ids, api_lp, local_lp, mapped_n))) {
+                        fprintf(stderr, "%s KL sample allocation failed\n", id);
+                        return 1;
+                    }
                     for (int a = 0; a < mapped_n; a++) {
                         for (int b = a + 1; b < mapped_n; b++) {
                             if (mapped_ids[a] == mapped_ids[b]) continue;
@@ -1223,6 +1273,17 @@ int main(int argc, char **argv) {
             total_api.pair_agree,
             total_api.pair_total,
             safe_ratio(total_api.pair_agree, total_api.pair_total));
+    if (kl.n) {
+        double sum = 0.0;
+        for (size_t i = 0; i < kl.n; i++) sum += kl.v[i];
+        qsort(kl.v, kl.n, sizeof(kl.v[0]), cmp_double);
+        fprintf(stderr,
+                "api_kl positions=%zu mean=%.6f median=%.6f p90=%.6f p99=%.6f max=%.6f "
+                "(top-N plus tail bucket; lower bound on full-vocabulary KL)\n",
+                kl.n, sum / (double)kl.n, kl.v[kl.n / 2], kl.v[kl.n * 9 / 10],
+                kl.v[kl.n * 99 / 100], kl.v[kl.n - 1]);
+    }
+    free(kl.v);
 
     fclose(out);
     fclose(mf);
